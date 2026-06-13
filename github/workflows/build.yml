@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master" ]    # 改成了 master
+  workflow_dispatch:          # 保留手动触发
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows 版本：直接在 Windows 运行器上编译
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: x86_64-pc-windows-msvc   # 使用 MSVC 工具链
+    - name: Build
+      run: cargo build --release --target x86_64-pc-windows-msvc
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dn-pak-rs-windows
+        path: target/x86_64-pc-windows-msvc/release/dn-pak-rs.exe
+
+  # Linux 版本：在 Ubuntu 上编译
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: x86_64-unknown-linux-gnu
+    - name: Build
+      run: cargo build --release --target x86_64-unknown-linux-gnu
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dn-pak-rs-linux
+        path: target/x86_64-unknown-linux-gnu/release/dn-pak-rs
