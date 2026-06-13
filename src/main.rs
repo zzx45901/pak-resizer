@@ -19,7 +19,7 @@ fn main() -> io::Result<()> {
             match choice.trim() {
                 "1" => break "enlarge",
                 "2" => break "shrink",
-                "0" => return Ok(()), // 直接退出
+                "0" => return Ok(()),
                 _ => println!("无效输入，请重新输入。"),
             }
         };
@@ -32,7 +32,7 @@ fn main() -> io::Result<()> {
         let path = path_input.trim().trim_matches('"');
         if path.is_empty() || !Path::new(path).exists() {
             eprintln!("错误：文件不存在。\n");
-            continue; // 返回主菜单
+            continue;
         }
 
         let metadata = match fs::metadata(path) {
@@ -130,8 +130,9 @@ fn detect_padding(path: &str) -> io::Result<(u64, u64)> {
             if buf[i] == 0 {
                 zeros_in_block += 1;
             } else {
-                padding_bytes += zeros_in_block;
-                let original_size = seek_pos + (read_size - zeros_in_block) as u64;
+                padding_bytes += zeros_in_block; // zeros_in_block 是 u64
+                let zeros_in_block_usize = zeros_in_block as usize;
+                let original_size = seek_pos + (read_size - zeros_in_block_usize) as u64;
                 return Ok((original_size, padding_bytes));
             }
         }
