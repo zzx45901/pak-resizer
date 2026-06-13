@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [ "master" ]    # 改成了 master
+    branches: [ "main" ]    # 改成了 master
   workflow_dispatch:          # 保留手动触发
 
 env:
