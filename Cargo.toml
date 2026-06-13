@@ -1,0 +1,13 @@
+[package]
+name = "dn-pak-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cipher = { version = "0.4", features = ["block-padding"] }
+aes = "0.8"
+ecb = "0.1"
+flate2 = "1.0"
+tracing-subscriber = "0.3"
+tracing = "0.1"
+hex = "0.4"
