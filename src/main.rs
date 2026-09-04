@@ -114,11 +114,11 @@ fn main() -> io::Result<()> {
                 println!("正在填充到 500 MB ...");
                 let file = OpenOptions::new().write(true).open(&output_path)?;
                 file.set_len(TARGET_SIZE)?;
-                println!(" 填充完成，最终大小：500 MB");
+                println!("✅ 填充完成，最终大小：500 MB");
             } else {
                 println!("文件已 ≥ 500 MB，无需填充。");
             }
-            println!("\n 合并完成！输出文件：{}", output_path.display());
+            println!("\n✅ 合并完成！输出文件：{}", output_path.display());
         }
         Err(e) => {
             println!("打包失败：{}", e);
