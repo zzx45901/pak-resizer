@@ -8,10 +8,10 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use chrono::{Local, Datelike, Timelike};
 
-const TARGET_SIZE: u64 = 500 * 1024 * 1024;
+const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
 const HEADER_MAGIC: &[u8] = b"EyedentityGames Packing File 0.1\0";
-const HEADER_OFFSET: u64 = 0x104;             // 260，文件头数据区起始
-const DATA_START_OFFSET: u64 = 0x104 + 8;     // 268，文件数据区起始
+const HEADER_OFFSET_FILE_COUNT: u64 = 0x104; // 文件数写入位置
+const DATA_START_OFFSET: u64 = 0x104 + 8; // 数据区起始偏移 0x10C
 
 fn main() -> io::Result<()> {
     println!("=== PAK 合并工具（无加密）===\n");
@@ -62,6 +62,19 @@ fn main() -> io::Result<()> {
         break files;
     };
 
+    // 读取第一个 PAK 偏移 0x100 处的 4 字节字段（用于写回）
+    let mut custom_field: u32 = 0xB0; // 默认值
+    if let Some(first_pak) = pak_files.first() {
+        if let Ok(mut f) = File::open(first_pak) {
+            if f.seek(SeekFrom::Start(0x100)).is_ok() {
+                let mut buf = [0u8; 4];
+                if f.read_exact(&mut buf).is_ok() {
+                    custom_field = u32::from_le_bytes(buf);
+                }
+            }
+        }
+    }
+
     // ---------- 提取并合并（后覆盖前）----------
     println!("\n正在提取并合并文件...");
     let mut merged_files: HashMap<String, Vec<u8>> = HashMap::new();
@@ -105,7 +118,7 @@ fn main() -> io::Result<()> {
 
     // ---------- 重新打包 ----------
     println!("\n正在打包...");
-    match create_pak(&output_path, &merged_files) {
+    match create_pak(&output_path, &merged_files, custom_field) {
         Ok(()) => {
             println!("打包完成。");
             let metadata = fs::metadata(&output_path)?;
@@ -138,7 +151,7 @@ fn extract_files_from_pak(pak_path: &Path) -> io::Result<Vec<(String, Vec<u8>)>>
     let mut fs = BufReader::new(file);
 
     // 读取文件头：跳过标识区，在 0x104 处读取 file_count 和 index_table_offset
-    fs.seek(SeekFrom::Start(HEADER_OFFSET))?;
+    fs.seek(SeekFrom::Start(HEADER_OFFSET_FILE_COUNT))?;
     let mut buf = [0u8; 8];
     fs.read_exact(&mut buf)?;
     let file_count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -190,7 +203,7 @@ fn extract_files_from_pak(pak_path: &Path) -> io::Result<Vec<(String, Vec<u8>)>>
 }
 
 // ---------- 打包为新 PAK（无加密，所有文件统一 zlib 压缩）----------
-fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Result<()> {
+fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>, custom_field: u32) -> io::Result<()> {
     let mut sorted_files: Vec<(&String, &Vec<u8>)> = files.iter().collect();
     sorted_files.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -198,14 +211,17 @@ fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Resul
 
     // 写入文件头标识
     file.write_all(HEADER_MAGIC)?;
-    // 填充零直到偏移 HEADER_OFFSET (0x104)
+    // 填充零至偏移 0x100
     let current_pos = HEADER_MAGIC.len() as u64;
-    let padding_len = HEADER_OFFSET - current_pos;
-    if padding_len > 0 {
-        file.write_all(&vec![0u8; padding_len as usize])?;
+    let padding_to_0x100 = 0x100 - current_pos;
+    if padding_to_0x100 > 0 {
+        file.write_all(&vec![0u8; padding_to_0x100 as usize])?;
     }
 
-    // 写入 8 字节头部占位（file_count, index_table_offset），之后回填
+    // 写入偏移 0x100 处的 4 字节字段
+    file.write_all(&custom_field.to_le_bytes())?;
+
+    // 写入偏移 0x104 处的 8 字节占位（file_count, index_table_offset），之后回填
     file.write_all(&[0u8; 8])?;
 
     let mut index_entries: Vec<(String, u32, u32, u32, u32, u32, [u8; 40])> = Vec::new();
@@ -266,7 +282,7 @@ fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Resul
     // 回填头部：file_count 和 index_table_offset
     file.flush()?;
     let mut file_mut = OpenOptions::new().write(true).open(output_path)?;
-    file_mut.seek(SeekFrom::Start(HEADER_OFFSET))?;
+    file_mut.seek(SeekFrom::Start(HEADER_OFFSET_FILE_COUNT))?;
     file_mut.write_all(&(index_entries.len() as u32).to_le_bytes())?; // file_count
     file_mut.write_all(&(index_table_offset as u32).to_le_bytes())?;  // index_table_offset
 
