@@ -76,7 +76,7 @@ fn main() -> io::Result<()> {
                         println!("  ↻ 覆盖文件：{}", file_path);
                     }
                 }
-                println!("  提取了 {} 个文件", files.len());
+                println!("  提取了 {} 个文件", count);
             }
             Err(e) => {
                 println!("  提取失败：{}", e);
