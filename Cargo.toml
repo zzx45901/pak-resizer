@@ -1,7 +1,7 @@
 [package]
 name = "dn-pak-rs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 cipher = { version = "0.4", features = ["block-padding"] }
