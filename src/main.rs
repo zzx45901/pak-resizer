@@ -9,8 +9,9 @@ use flate2::Compression;
 use chrono::{Local, Datelike, Timelike};
 
 const TARGET_SIZE: u64 = 500 * 1024 * 1024;
-const HEADER_OFFSET: u64 = 256;
-const DATA_START_OFFSET: u64 = 256 + 12;
+const HEADER_MAGIC: &[u8] = b"EyedentityGames Packing File 0.1\0";
+const HEADER_OFFSET: u64 = 0x104;             // 260，文件头数据区起始
+const DATA_START_OFFSET: u64 = 0x104 + 8;     // 268，文件数据区起始
 
 fn main() -> io::Result<()> {
     println!("=== PAK 合并工具（无加密）===\n");
@@ -69,7 +70,7 @@ fn main() -> io::Result<()> {
         println!("[{}/{}] 处理 {}", i + 1, pak_files.len(), pak_path.display());
         match extract_files_from_pak(pak_path) {
             Ok(files) => {
-                let count = files.len();  // 先保存长度
+                let count = files.len();
                 for (file_path, data) in files {
                     let prev = merged_files.insert(file_path.clone(), data);
                     if prev.is_some() {
@@ -136,15 +137,16 @@ fn extract_files_from_pak(pak_path: &Path) -> io::Result<Vec<(String, Vec<u8>)>>
     let file = File::open(pak_path)?;
     let mut fs = BufReader::new(file);
 
+    // 读取文件头：跳过标识区，在 0x104 处读取 file_count 和 index_table_offset
     fs.seek(SeekFrom::Start(HEADER_OFFSET))?;
-    let mut buf = [0u8; 12];
+    let mut buf = [0u8; 8];
     fs.read_exact(&mut buf)?;
-    let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let file_count = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    let index_table_offset = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    let file_count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let index_table_offset = u32::from_le_bytes(buf[4..8].try_into().unwrap());
 
-    println!("  PAK 信息：version={}, 文件数={}, 索引偏移={}", version, file_count, index_table_offset);
+    println!("  PAK 信息：文件数={}, 索引偏移={}", file_count, index_table_offset);
 
+    // 读取索引表
     let mut entries = Vec::with_capacity(file_count as usize);
     for i in 0..file_count {
         fs.seek(SeekFrom::Start(index_table_offset as u64 + i as u64 * 316))?;
@@ -161,6 +163,7 @@ fn extract_files_from_pak(pak_path: &Path) -> io::Result<Vec<(String, Vec<u8>)>>
         entries.push((file_path, raw_size, compressed_size, file_offset));
     }
 
+    // 提取每个文件
     let mut files = Vec::new();
     for (path, raw_size, compressed_size, file_offset) in entries {
         let mut data_file = File::open(pak_path)?;
@@ -193,13 +196,23 @@ fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Resul
 
     let mut file = BufWriter::new(File::create(output_path)?);
 
-    file.write_all(&vec![0u8; HEADER_OFFSET as usize])?;
-    file.write_all(&[0u8; 12])?;
+    // 写入文件头标识
+    file.write_all(HEADER_MAGIC)?;
+    // 填充零直到偏移 HEADER_OFFSET (0x104)
+    let current_pos = HEADER_MAGIC.len() as u64;
+    let padding_len = HEADER_OFFSET - current_pos;
+    if padding_len > 0 {
+        file.write_all(&vec![0u8; padding_len as usize])?;
+    }
+
+    // 写入 8 字节头部占位（file_count, index_table_offset），之后回填
+    file.write_all(&[0u8; 8])?;
 
     let mut index_entries: Vec<(String, u32, u32, u32, u32, u32, [u8; 40])> = Vec::new();
     let mut current_offset: u64 = DATA_START_OFFSET;
 
     for (path, data) in sorted_files {
+        // 统一进行 zlib 压缩
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data)?;
         let compressed = encoder.finish()?;
@@ -207,8 +220,10 @@ fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Resul
         let raw_size = data.len() as u32;
         let compressed_size = compressed.len() as u32;
 
+        // 写入文件数据
         file.write_all(&compressed)?;
 
+        // 索引信息：路径，压缩后大小，原始大小，第三大小（设为压缩后大小），偏移，未知(0)，40字节填充
         let path_with_slash = if path.starts_with('\\') {
             path.clone()
         } else {
@@ -227,14 +242,17 @@ fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Resul
         current_offset += compressed_size as u64;
     }
 
+    // 写入索引表
     let index_table_offset = current_offset;
     for (path, zsize, size, zsize1, offset, unk3, padding) in &index_entries {
+        // 写入 256 字节路径
         let mut path_buf = [0u8; 256];
         let bytes = path.as_bytes();
         let len = bytes.len().min(256);
         path_buf[..len].copy_from_slice(&bytes[..len]);
         file.write_all(&path_buf)?;
 
+        // 写入 60 字节元信息
         let mut info = [0u8; 60];
         info[0..4].copy_from_slice(&zsize.to_le_bytes());
         info[4..8].copy_from_slice(&size.to_le_bytes());
@@ -245,20 +263,21 @@ fn create_pak(output_path: &Path, files: &HashMap<String, Vec<u8>>) -> io::Resul
         file.write_all(&info)?;
     }
 
+    // 回填头部：file_count 和 index_table_offset
     file.flush()?;
     let mut file_mut = OpenOptions::new().write(true).open(output_path)?;
     file_mut.seek(SeekFrom::Start(HEADER_OFFSET))?;
-    file_mut.write_all(&1u32.to_le_bytes())?;
-    file_mut.write_all(&(index_entries.len() as u32).to_le_bytes())?;
-    file_mut.write_all(&(index_table_offset as u32).to_le_bytes())?;
+    file_mut.write_all(&(index_entries.len() as u32).to_le_bytes())?; // file_count
+    file_mut.write_all(&(index_table_offset as u32).to_le_bytes())?;  // index_table_offset
 
     Ok(())
 }
 
+// ---------- 生成输出文件名：0dnResource00-合并YYMMDDHHMMSS.pak ----------
 fn generate_output_name() -> String {
     let now = Local::now();
     format!(
-        "0dnResource00-合并{:02}{:02}{:02}{:02}{:02}{:02}",
+        "0dnResource00-合并{:02}{:02}{:02}{:02}{:02}{:02}.pak",
         now.year() % 100,
         now.month(),
         now.day(),
@@ -268,6 +287,7 @@ fn generate_output_name() -> String {
     )
 }
 
+// ---------- 解析输入字符串（支持带引号路径）----------
 fn parse_paths(input: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut current = String::new();
