@@ -69,6 +69,7 @@ fn main() -> io::Result<()> {
         println!("[{}/{}] 处理 {}", i + 1, pak_files.len(), pak_path.display());
         match extract_files_from_pak(pak_path) {
             Ok(files) => {
+                let count = files.len();  // 先保存长度
                 for (file_path, data) in files {
                     let prev = merged_files.insert(file_path.clone(), data);
                     if prev.is_some() {
