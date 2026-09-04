@@ -1,114 +1,150 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
 
 fn main() -> io::Result<()> {
-    println!("=== PAK 文件大小调整工具 ===\n");
+    println!("=== DN PAK 文件大小调整工具 ===\n");
+    println!("自动规则：");
+    println!("  • 文件 < 500 MB → 填充到 500 MB");
+    println!("  • 文件 ≥ 500 MB 且尾部有填充 → 移除填充");
+    println!("  • 文件 ≥ 500 MB 且无填充 → 不处理");
+    println!("  • 支持拖入多个文件或文件夹，将批量处理\n");
 
     loop {
-        // 1. 选择模式（新增退出选项）
-        let mode = loop {
-            println!("请选择操作：");
-            println!("  1. 放大（填充到 500 MB）");
-            println!("  2. 缩小（自动移除尾部填充）");
-            println!("  0. 退出");
-            print!("输入数字 (1/2/0): ");
-            io::stdout().flush()?;
-            let mut choice = String::new();
-            io::stdin().read_line(&mut choice)?;
-            match choice.trim() {
-                "1" => break "enlarge",
-                "2" => break "shrink",
-                "0" => return Ok(()),
-                _ => println!("无效输入，请重新输入。"),
-            }
-        };
-
-        // 2. 拖入文件
-        print!("\n请将 PAK 文件拖入此窗口，然后按回车：");
+        print!("请拖入 PAK 文件或文件夹（多个用空格分隔，输入 0 退出），然后按回车：");
         io::stdout().flush()?;
-        let mut path_input = String::new();
-        io::stdin().read_line(&mut path_input)?;
-        let path = path_input.trim().trim_matches('"');
-        if path.is_empty() || !Path::new(path).exists() {
-            eprintln!("错误：文件不存在。\n");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input == "0" {
+            println!("程序退出。");
+            break;
+        }
+
+        if input.is_empty() {
             continue;
         }
 
-        let metadata = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("读取文件信息失败: {}\n", e);
+        // 解析输入，得到所有目标路径（文件或文件夹）
+        let raw_paths = parse_paths(input);
+        if raw_paths.is_empty() {
+            println!("未识别到有效路径，请重试。\n");
+            continue;
+        }
+
+        // 收集所有需要处理的 .pak 文件
+        let mut pak_files: Vec<PathBuf> = Vec::new();
+        for raw in raw_paths {
+            let p = Path::new(&raw);
+            if !p.exists() {
+                println!("路径不存在，跳过: {}", raw);
                 continue;
             }
-        };
-        let current_size = metadata.len();
-        let current_mb = current_size as f64 / (1024.0 * 1024.0);
-        println!("\n当前文件大小: {} 字节 (≈{:.2} MB)", current_size, current_mb);
 
-        // 3. 执行操作
-        match mode {
-            "enlarge" => {
-                let target_mb = 500u64;
-                let target_size = target_mb * 1024 * 1024;
-                if current_size >= target_size {
-                    println!("文件已经 ≥ {} MB，无需放大。\n", target_mb);
-                    continue;
-                }
-
-                println!("正在放大到 {} MB ...", target_mb);
-                let file = match OpenOptions::new().write(true).open(path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("打开文件失败: {}\n", e);
-                        continue;
+            if p.is_dir() {
+                // 扫描文件夹下的 .pak 文件（非递归）
+                match fs::read_dir(p) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|e| e.to_str()) == Some("pak") {
+                                pak_files.push(path);
+                            }
+                        }
                     }
-                };
-                if let Err(e) = file.set_len(target_size) {
-                    eprintln!("操作失败: {}\n", e);
-                } else {
-                    println!("✅ 放大完成！文件大小: {} MB\n", target_mb);
+                    Err(e) => println!("读取文件夹失败: {} ({})", raw, e),
                 }
+            } else if p.extension().and_then(|e| e.to_str()) == Some("pak") {
+                pak_files.push(p.to_path_buf());
+            } else {
+                println!("不是 .pak 文件，跳过: {}", raw);
             }
-
-            "shrink" => {
-                let (original_size, padding_len) = match detect_padding(path) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("检测填充失败: {}\n", e);
-                        continue;
-                    }
-                };
-
-                if padding_len < 1024 {
-                    println!("\n未检测到明显填充（尾部连续零字节不足 1 KB），文件无需缩小。\n");
-                    continue;
-                }
-
-                let removed_mb = padding_len as f64 / (1024.0 * 1024.0);
-                let original_mb = original_size as f64 / (1024.0 * 1024.0);
-                println!("\n检测到填充 {} 字节 (≈{:.2} MB)", padding_len, removed_mb);
-                println!("移除填充后文件大小: {} 字节 (≈{:.2} MB)", original_size, original_mb);
-
-                let file = match OpenOptions::new().write(true).open(path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("打开文件失败: {}\n", e);
-                        continue;
-                    }
-                };
-                if let Err(e) = file.set_len(original_size) {
-                    eprintln!("操作失败: {}\n", e);
-                } else {
-                    println!("✅ 缩小完成！\n");
-                }
-            }
-            _ => unreachable!(),
         }
+
+        if pak_files.is_empty() {
+            println!("未找到任何 .pak 文件。\n");
+            continue;
+        }
+
+        println!("\n共找到 {} 个 .pak 文件，开始处理...", pak_files.len());
+
+        // 依次处理每个文件
+        for (idx, file_path) in pak_files.iter().enumerate() {
+            println!("\n[{}/{}] 处理: {}", idx + 1, pak_files.len(), file_path.display());
+            match process_single_file(file_path) {
+                Ok(()) => {}
+                Err(e) => println!("  处理失败: {}", e),
+            }
+        }
+
+        println!("\n 批处理完成！\n");
     }
+    Ok(())
 }
 
-fn detect_padding(path: &str) -> io::Result<(u64, u64)> {
+/// 处理单个 PAK 文件（智能判断放大/缩小）
+fn process_single_file(file_path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(file_path)?;
+    let current_size = metadata.len();
+    let current_mb = current_size as f64 / (1024.0 * 1024.0);
+    println!("  当前大小: {} 字节 (≈{:.2} MB)", current_size, current_mb);
+
+    if current_size < TARGET_SIZE {
+        // 放大
+        println!("  文件小于 500 MB，正在填充...");
+        let file = OpenOptions::new().write(true).open(file_path)?;
+        file.set_len(TARGET_SIZE)?;
+        println!("  已放大到 500 MB");
+    } else {
+        // 检测尾部填充
+        let (original_size, padding_len) = detect_padding(file_path)?;
+        if padding_len < 1024 {
+            println!("  未检测到明显填充，无需处理。");
+        } else {
+            let removed_mb = padding_len as f64 / (1024.0 * 1024.0);
+            let original_mb = original_size as f64 / (1024.0 * 1024.0);
+            println!("  检测到填充 {} 字节 (≈{:.2} MB)", padding_len, removed_mb);
+            println!("  移除填充后大小: {} 字节 (≈{:.2} MB)", original_size, original_mb);
+            let file = OpenOptions::new().write(true).open(file_path)?;
+            file.set_len(original_size)?;
+            println!("  已移除填充");
+        }
+    }
+    Ok(())
+}
+
+/// 解析输入字符串，支持带引号的路径（Windows 拖入多个文件时会自动加引号）
+fn parse_paths(input: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in input.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes; // 切换引号状态
+            }
+            ' ' if !in_quotes => {
+                // 空格分隔（不在引号内）
+                if !current.is_empty() {
+                    paths.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        paths.push(current);
+    }
+    paths
+}
+
+/// 检测文件尾部连续零字节填充，返回（原始大小，填充长度）
+fn detect_padding(path: &Path) -> io::Result<(u64, u64)> {
     let mut file = OpenOptions::new().read(true).open(path)?;
     let file_size = file.metadata()?.len();
     if file_size == 0 {
@@ -130,7 +166,7 @@ fn detect_padding(path: &str) -> io::Result<(u64, u64)> {
             if buf[i] == 0 {
                 zeros_in_block += 1;
             } else {
-                padding_bytes += zeros_in_block; // zeros_in_block 是 u64
+                padding_bytes += zeros_in_block;
                 let zeros_in_block_usize = zeros_in_block as usize;
                 let original_size = seek_pos + (read_size - zeros_in_block_usize) as u64;
                 return Ok((original_size, padding_bytes));
