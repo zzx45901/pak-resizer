@@ -19,130 +19,135 @@ fn main() -> io::Result<()> {
     println!("功能：提取多个 PAK 中的所有文件，合并（后覆盖前）并重新打包为一个 PAK，自动填充到 500 MB。");
     println!("规则：仅支持拖入 .pak 文件，不支持文件夹。\n");
 
-    // ---------- 收集输入 .pak 文件 ----------
-    let pak_files = loop {
-        print!("请拖入多个 .pak 文件（可同时拖入多个），然后按回车：");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
+    loop {
+        // ---------- 收集输入 .pak 文件 ----------
+        let pak_files = loop {
+            print!("请拖入多个 .pak 文件，然后按回车：");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let input = input.trim();
 
-        if input.is_empty() {
-            println!("未输入任何路径，请重试。");
-            continue;
-        }
+            if input == "0" {
+                println!("程序退出。");
+                return Ok(());
+            }
 
-        let raw_paths = parse_paths(input);
-        let mut files = Vec::new();
-        for raw in raw_paths {
-            let p = Path::new(&raw);
-            if !p.exists() {
-                println!("路径不存在，跳过：{}", raw);
+            if input.is_empty() {
+                println!("未输入任何路径，请重试。");
                 continue;
             }
-            if p.is_dir() {
-                println!("不支持文件夹，请直接拖入 .pak 文件：{}", raw);
-                continue;
-            }
-            if p.extension().and_then(|e| e.to_str()) == Some("pak") {
-                files.push(p.to_path_buf());
-            } else {
-                println!("不是 .pak 文件，跳过：{}", raw);
-            }
-        }
 
-        if files.is_empty() {
-            println!("未找到任何 .pak 文件，请重新输入。\n");
-            continue;
-        }
-
-        println!("\n找到 {} 个 PAK 文件，按拖入顺序处理。", files.len());
-        for (i, f) in files.iter().enumerate() {
-            println!("  {}: {}", i + 1, f.display());
-        }
-        break files;
-    };
-
-    // 读取第一个 PAK 偏移 0x100 处的 4 字节字段（用于写回）
-    let mut custom_field: u32 = 0xB0; // 默认值
-    if let Some(first_pak) = pak_files.first() {
-        if let Ok(mut f) = File::open(first_pak) {
-            if f.seek(SeekFrom::Start(0x100)).is_ok() {
-                let mut buf = [0u8; 4];
-                if f.read_exact(&mut buf).is_ok() {
-                    custom_field = u32::from_le_bytes(buf);
+            let raw_paths = parse_paths(input);
+            let mut files = Vec::new();
+            for raw in raw_paths {
+                let p = Path::new(&raw);
+                if !p.exists() {
+                    println!("路径不存在，跳过：{}", raw);
+                    continue;
+                }
+                if p.is_dir() {
+                    println!("不支持文件夹，请直接拖入 .pak 文件：{}", raw);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) == Some("pak") {
+                    files.push(p.to_path_buf());
+                } else {
+                    println!("不是 .pak 文件，跳过：{}", raw);
                 }
             }
-        }
-    }
 
-    // ---------- 提取并合并（后覆盖前）----------
-    println!("\n正在提取并合并文件...");
-    let mut merged_files: HashMap<String, Vec<u8>> = HashMap::new();
+            if files.is_empty() {
+                println!("未找到任何 .pak 文件，请重新输入。\n");
+                continue;
+            }
 
-    for (i, pak_path) in pak_files.iter().enumerate() {
-        println!("[{}/{}] 处理 {}", i + 1, pak_files.len(), pak_path.display());
-        match extract_files_from_pak(pak_path) {
-            Ok(files) => {
-                let count = files.len();
-                for (file_path, data) in files {
-                    let prev = merged_files.insert(file_path.clone(), data);
-                    if prev.is_some() {
-                        println!("  ↻ 覆盖文件：{}", file_path);
+            println!("\n找到 {} 个 PAK 文件，按拖入顺序处理。", files.len());
+            for (i, f) in files.iter().enumerate() {
+                println!("  {}: {}", i + 1, f.display());
+            }
+            break files;
+        };
+
+        // 读取第一个 PAK 偏移 0x100 处的 4 字节字段（用于写回）
+        let mut custom_field: u32 = 0xB0; // 默认值
+        if let Some(first_pak) = pak_files.first() {
+            if let Ok(mut f) = File::open(first_pak) {
+                if f.seek(SeekFrom::Start(0x100)).is_ok() {
+                    let mut buf = [0u8; 4];
+                    if f.read_exact(&mut buf).is_ok() {
+                        custom_field = u32::from_le_bytes(buf);
                     }
                 }
-                println!("  提取了 {} 个文件", count);
+            }
+        }
+
+        // ---------- 提取并合并（后覆盖前）----------
+        println!("\n正在提取并合并文件...");
+        let mut merged_files: HashMap<String, Vec<u8>> = HashMap::new();
+
+        for (i, pak_path) in pak_files.iter().enumerate() {
+            println!("[{}/{}] 处理 {}", i + 1, pak_files.len(), pak_path.display());
+            match extract_files_from_pak(pak_path) {
+                Ok(files) => {
+                    let count = files.len();
+                    for (file_path, data) in files {
+                        let prev = merged_files.insert(file_path.clone(), data);
+                        if prev.is_some() {
+                            println!("  ↻ 覆盖文件：{}", file_path);
+                        }
+                    }
+                    println!("  提取了 {} 个文件", count);
+                }
+                Err(e) => {
+                    println!("  提取失败：{}", e);
+                }
+            }
+        }
+
+        if merged_files.is_empty() {
+            println!("\n错误：没有提取到任何文件，无法打包。");
+            continue;
+        }
+
+        println!("\n合并后共有 {} 个文件。", merged_files.len());
+
+        // ---------- 生成输出文件路径（第一个 PAK 所在目录）----------
+        let first_pak_dir = pak_files
+            .first()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let output_name = generate_output_name();
+        let output_path = first_pak_dir.join(output_name);
+        println!("输出文件：{}", output_path.display());
+
+        // ---------- 重新打包 ----------
+        println!("\n正在打包...");
+        match create_pak(&output_path, &merged_files, custom_field) {
+            Ok(()) => {
+                println!("打包完成。");
+                let metadata = fs::metadata(&output_path)?;
+                let size = metadata.len();
+                let size_mb = size as f64 / (1024.0 * 1024.0);
+                println!("打包后大小：{} 字节 (≈{:.2} MB)", size, size_mb);
+                if size < TARGET_SIZE {
+                    println!("正在使用 0xDEADBEEF 模式填充到 500 MB ...");
+                    fill_file_with_pattern(&output_path, TARGET_SIZE)?;
+                    println!(" 填充完成，最终大小至少 500 MB");
+                } else {
+                    println!("文件已 ≥ 500 MB，无需填充。");
+                }
+                println!("\n 合并完成！输出文件：{}", output_path.display());
             }
             Err(e) => {
-                println!("  提取失败：{}", e);
+                println!("打包失败：{}", e);
             }
         }
+
+        println!("\n----------------------------------------\n");
     }
-
-    if merged_files.is_empty() {
-        println!("\n错误：没有提取到任何文件，无法打包。");
-        return Ok(());
-    }
-
-    println!("\n合并后共有 {} 个文件。", merged_files.len());
-
-    // ---------- 生成输出文件路径（第一个 PAK 所在目录）----------
-    let first_pak_dir = pak_files
-        .first()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let output_name = generate_output_name();
-    let output_path = first_pak_dir.join(output_name);
-    println!("输出文件：{}", output_path.display());
-
-    // ---------- 重新打包 ----------
-    println!("\n正在打包...");
-    match create_pak(&output_path, &merged_files, custom_field) {
-        Ok(()) => {
-            println!("打包完成。");
-            let metadata = fs::metadata(&output_path)?;
-            let size = metadata.len();
-            let size_mb = size as f64 / (1024.0 * 1024.0);
-            println!("打包后大小：{} 字节 (≈{:.2} MB)", size, size_mb);
-            if size < TARGET_SIZE {
-                println!("正在使用 0xDEADBEEF 模式填充到 500 MB ...");
-                fill_file_with_pattern(&output_path, TARGET_SIZE)?;
-                println!(" 填充完成，最终大小至少 500 MB");
-            } else {
-                println!("文件已 ≥ 500 MB，无需填充。");
-            }
-            println!("\n 合并完成！输出文件：{}", output_path.display());
-        }
-        Err(e) => {
-            println!("打包失败：{}", e);
-        }
-    }
-
-    println!("按回车键退出...");
-    let _ = io::stdin().read_line(&mut String::new());
-    Ok(())
 }
 
 // ---------- 从单个 PAK 中提取文件（仅非加密解压）----------
