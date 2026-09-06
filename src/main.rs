@@ -2,13 +2,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom, BufWriter};
 use std::path::{Path, PathBuf};
 
-const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 目标大小（至少）
+const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
 const PADDING_PATTERN: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+const SCAN_BLOCK_SIZE: usize = 64 * 1024; // 64 KB
 
 fn main() -> io::Result<()> {
-    println!("===DN PAK 文件大小调整工具v1.2 ===\n");
+    println!("=== DN PAK 文件大小调整工具 ===\n");
     println!("自动规则：");
-    println!("  • 文件 < 500 MB → 填充至少至 500 MB");
+    println!("  • 文件 < 500 MB → 填充至至少 500 MB");
     println!("  • 文件 ≥ 500 MB 且尾部有填充 → 移除填充");
     println!("  • 文件 ≥ 500 MB 且无填充 → 不处理");
     println!("  • 支持拖入多个文件或文件夹，将批量处理\n");
@@ -109,7 +110,7 @@ fn process_single_file(file_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 填充文件至至少 target_size，直接循环写入模式，不要求精确倍数
+/// 填充文件至至少 target_size，只写入完整的 4 字节模式，不添加额外 0x00
 fn fill_with_pattern(file_path: &Path, target_size: u64) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(file_path)?;
     let current_size = file.metadata()?.len();
@@ -118,29 +119,35 @@ fn fill_with_pattern(file_path: &Path, target_size: u64) -> io::Result<()> {
     }
 
     file.seek(SeekFrom::Start(current_size))?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
     let mut remaining = target_size - current_size;
 
-    // 缓冲区大小设为 4 的倍数，但写入时可能多写几个字节也没关系
-    let mut buffer = [0u8; 4096];
-    // 填充缓冲区，循环写入
-    while remaining > 0 {
+    // 64KB 缓冲区，预填充模式
+    let mut buffer = [0u8; 64 * 1024];
+    for i in (0..buffer.len()).step_by(4) {
+        buffer[i..i + 4].copy_from_slice(&PADDING_PATTERN);
+    }
+
+    while remaining >= 4 {
         let chunk = std::cmp::min(remaining, buffer.len() as u64) as usize;
-        // 用模式填充整个 chunk
-        for i in (0..chunk).step_by(4) {
-            let end = std::cmp::min(i + 4, chunk);
-            let copy_len = end - i;
-            buffer[i..end].copy_from_slice(&PADDING_PATTERN[..copy_len]);
-        }
+        // 确保 chunk 是 4 的倍数，但 remaining 本来就是4的倍数（target_size 是4的倍数）
+        let chunk = (chunk / 4) * 4;
         writer.write_all(&buffer[..chunk])?;
         remaining -= chunk as u64;
     }
+
+    // 理论上 remaining 此时为 0，因为 target_size 是 4 的倍数，且 remaining 初始也是4的倍数
+    // 但如果由于某些原因 remaining 不为 0（例如目标大小不是4的倍数），则直接写入完整模式超一点
+    if remaining > 0 {
+        writer.write_all(&PADDING_PATTERN)?;
+    }
+
     writer.flush()?;
     Ok(())
 }
 
 /// 检测文件末尾的 0xDEADBEEF 重复模式，返回（原始大小，填充长度）
-/// 简化逻辑：直接从末尾逐4字节匹配，不检查倍数和阈值
+/// 使用大缓冲区扫描，不要求文件大小为4的倍数
 fn detect_pattern_padding(path: &Path) -> io::Result<(u64, u64)> {
     let mut file = OpenOptions::new().read(true).open(path)?;
     let file_size = file.metadata()?.len();
@@ -150,27 +157,35 @@ fn detect_pattern_padding(path: &Path) -> io::Result<(u64, u64)> {
 
     let mut pos = file_size;
     let mut padding_bytes = 0u64;
-    let mut buf = [0u8; 4];
+    let mut buf = vec![0u8; SCAN_BLOCK_SIZE];
 
     while pos >= 4 {
-        // 读取当前位置的前4字节（从 pos-4 到 pos）
-        file.seek(SeekFrom::Start(pos - 4))?;
-        file.read_exact(&mut buf)?;
+        let read_start = pos.saturating_sub(SCAN_BLOCK_SIZE as u64);
+        let read_len = (pos - read_start) as usize;
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut buf[..read_len])?;
 
-        if &buf == &PADDING_PATTERN {
-            padding_bytes += 4;
-            pos -= 4;
-        } else {
-            // 不匹配，停止
-            break;
+        // 从缓冲区末尾向前检查，步长4
+        let mut i = read_len;
+        while i >= 4 {
+            if &buf[i - 4..i] == &PADDING_PATTERN {
+                padding_bytes += 4;
+                i -= 4;
+            } else {
+                let original_size = read_start + i as u64;
+                return Ok((original_size, padding_bytes));
+            }
         }
+
+        // 整个缓冲区都是模式，继续向前
+        pos = read_start;
     }
 
-    // original_size 就是 pos（第一个不匹配的位置）
-    Ok((pos, padding_bytes))
+    // 文件全部是模式
+    Ok((0, file_size))
 }
 
-// ========== 路径解析（支持中文、双引号和盘符/UNC前缀） ==========
+// ========== 路径解析（支持中文、英文双引号和盘符/UNC前缀） ==========
 fn parse_paths(input: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut current = String::new();
