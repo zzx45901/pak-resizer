@@ -3,14 +3,14 @@ use std::io::{self, Read, Write, Seek, SeekFrom, BufWriter};
 use std::path::{Path, PathBuf};
 
 const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
-const PADDING_BYTE: u8 = 0x2E;             // 填充字符：'.'
+const PADDING_PATTERN: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF]; // 魔术填充模式
 
 fn main() -> io::Result<()> {
-    println!("===  DN PAK 大小调整工具 ===\n");
+    println!("=== DN PAK 文件大小调整工具 ===\n");
     println!("自动规则：");
-    println!("  • 文件 < 500 MB → 填充到 500 MB（使用 '.' 填充）");
-    println!("  • 文件 ≥ 500 MB 且尾部有 '.' 填充 → 移除填充");
-    println!("  • 文件 ≥ 500 MB 且无 '.' 填充 → 不处理");
+    println!("  • 文件 < 500 MB → 填充到 500 MB");
+    println!("  • 文件 ≥ 500 MB 且尾部有该模式填充 → 移除填充");
+    println!("  • 文件 ≥ 500 MB 且无该模式填充 → 不处理");
     println!("  • 支持拖入多个文件或文件夹，将批量处理\n");
 
     loop {
@@ -94,19 +94,19 @@ fn process_single_file(file_path: &Path) -> io::Result<()> {
     println!("  当前大小: {} 字节 (≈{:.2} MB)", current_size, current_mb);
 
     if current_size < TARGET_SIZE {
-        // 放大：使用 '.' 填充到 500 MB
-        println!("  文件小于 500 MB，正在使用 '.' 填充...");
-        fill_with_dot(file_path, TARGET_SIZE)?;
+        // 放大：使用模式填充到 500 MB
+        println!("  文件小于 500 MB，正在使用 0xDEADBEEF 模式填充...");
+        fill_with_pattern(file_path, TARGET_SIZE)?;
         println!("   已填充到 500 MB");
     } else {
-        // 检测尾部 '.' 填充
-        let (original_size, padding_len) = detect_dot_padding(file_path)?;
+        // 检测尾部模式填充
+        let (original_size, padding_len) = detect_pattern_padding(file_path)?;
         if padding_len < 1024 {
-            println!("  未检测到明显 '.' 填充，无需处理。");
+            println!("  未检测到明显模式填充，无需处理。");
         } else {
             let removed_mb = padding_len as f64 / (1024.0 * 1024.0);
             let original_mb = original_size as f64 / (1024.0 * 1024.0);
-            println!("  检测到 '.' 填充 {} 字节 (≈{:.2} MB)", padding_len, removed_mb);
+            println!("  检测到模式填充 {} 字节 (≈{:.2} MB)", padding_len, removed_mb);
             println!("  移除填充后大小: {} 字节 (≈{:.2} MB)", original_size, original_mb);
             let file = OpenOptions::new().write(true).open(file_path)?;
             file.set_len(original_size)?;
@@ -116,8 +116,8 @@ fn process_single_file(file_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 使用特定字符填充文件至目标大小
-fn fill_with_dot(file_path: &Path, target_size: u64) -> io::Result<()> {
+/// 使用魔术模式填充文件至目标大小
+fn fill_with_pattern(file_path: &Path, target_size: u64) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(file_path)?;
     let current_size = file.metadata()?.len();
     if current_size >= target_size {
@@ -127,13 +127,25 @@ fn fill_with_dot(file_path: &Path, target_size: u64) -> io::Result<()> {
     file.seek(SeekFrom::Start(current_size))?;
     let mut writer = BufWriter::new(file);
     let mut remaining = target_size - current_size;
-    let mut buffer = [PADDING_BYTE; 4096];
+    let pattern = PADDING_PATTERN;
+    let mut buffer = [0u8; 4096];
 
-    while remaining > 0 {
-        let chunk = std::cmp::min(remaining, buffer.len() as u64) as usize;
+    // 先填充完整模式块
+    while remaining >= 4 {
+        let chunk = std::cmp::min(remaining / 4 * 4, buffer.len() as u64) as usize;
+        for i in (0..chunk).step_by(4) {
+            buffer[i..i + 4].copy_from_slice(&pattern);
+        }
         writer.write_all(&buffer[..chunk])?;
         remaining -= chunk as u64;
     }
+
+    // 处理剩余不足4字节的部分，填充0xDE
+    if remaining > 0 {
+        let tail = vec![0xDE; remaining as usize];
+        writer.write_all(&tail)?;
+    }
+
     writer.flush()?;
     Ok(())
 }
@@ -164,40 +176,76 @@ fn parse_paths(input: &str) -> Vec<String> {
     paths
 }
 
-/// 检测文件尾部连续 '.' (0x2E) 填充，返回（原始大小，填充长度）
-fn detect_dot_padding(path: &Path) -> io::Result<(u64, u64)> {
+/// 检测文件尾部魔术模式填充，返回（原始大小，填充长度）
+fn detect_pattern_padding(path: &Path) -> io::Result<(u64, u64)> {
     let mut file = OpenOptions::new().read(true).open(path)?;
     let file_size = file.metadata()?.len();
     if file_size == 0 {
         return Ok((0, 0));
     }
 
-    let mut buf = vec![0u8; 4096];
+    const BLOCK_SIZE: usize = 4096;
+    let mut buf = vec![0u8; BLOCK_SIZE];
     let mut pos = file_size;
     let mut padding_bytes = 0u64;
 
-    while pos > 0 {
-        let read_size = std::cmp::min(buf.len() as u64, pos) as usize;
+    // 辅助函数：检查从缓冲区位置起的4字节是否等于模式
+    fn is_pattern(buf: &[u8], idx: usize) -> bool {
+        idx + 4 <= buf.len() && buf[idx..idx + 4] == PADDING_PATTERN
+    }
+
+    // 先读取最后一个块，处理尾部可能的不完整0xDE
+    if pos > 0 {
+        let read_size = std::cmp::min(pos as usize, BLOCK_SIZE) as usize;
         let seek_pos = pos - read_size as u64;
         file.seek(SeekFrom::Start(seek_pos))?;
         file.read_exact(&mut buf[..read_size])?;
 
-        let mut dots_in_block = 0;
-        for i in (0..read_size).rev() {
-            if buf[i] == PADDING_BYTE {
-                dots_in_block += 1;
-            } else {
-                padding_bytes += dots_in_block;
-                let dots_in_block_usize = dots_in_block as usize;
-                let original_size = seek_pos + (read_size - dots_in_block_usize) as u64;
-                return Ok((original_size, padding_bytes));
-            }
+        let mut i = read_size;
+        // 处理末尾连续的0xDE（最多3个，因为如果超过3个，则可能包含完整模式的一部分）
+        let mut tail_de = 0;
+        while i > 0 && buf[i - 1] == 0xDE && tail_de < 3 {
+            tail_de += 1;
+            i -= 1;
         }
-        // 整个块都是 '.'，继续向前
-        padding_bytes += read_size as u64;
+        padding_bytes += tail_de as u64;
+
+        // 然后匹配完整的模式
+        while i >= 4 && is_pattern(&buf[..i], i - 4) {
+            padding_bytes += 4;
+            i -= 4;
+        }
+
+        if i > 0 {
+            // 找到边界：非模式字节，原始大小 = seek_pos + i
+            let original_size = seek_pos + i as u64;
+            return Ok((original_size, padding_bytes));
+        }
+
+        // 当前块全部是填充，继续向前
         pos = seek_pos;
     }
 
-    // 整个文件全是 '.'
+    // 继续处理前面的块
+    while pos > 0 {
+        let read_size = std::cmp::min(pos as usize, BLOCK_SIZE) as usize;
+        let seek_pos = pos - read_size as u64;
+        file.seek(SeekFrom::Start(seek_pos))?;
+        file.read_exact(&mut buf[..read_size])?;
+
+        let mut i = read_size;
+        while i >= 4 && is_pattern(&buf[..i], i - 4) {
+            padding_bytes += 4;
+            i -= 4;
+        }
+
+        if i > 0 {
+            let original_size = seek_pos + i as u64;
+            return Ok((original_size, padding_bytes));
+        }
+        pos = seek_pos;
+    }
+
+    // 整个文件全是填充
     Ok((0, file_size))
 }
