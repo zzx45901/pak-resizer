@@ -6,7 +6,7 @@ const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 目标大小（至少）
 const PADDING_PATTERN: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
 fn main() -> io::Result<()> {
-    println!("===DN PAK 文件智能大小调整工具v1.2 ===\n");
+    println!("===DN PAK 文件大小调整工具v1.2 ===\n");
     println!("自动规则：");
     println!("  • 文件 < 500 MB → 填充至少至 500 MB");
     println!("  • 文件 ≥ 500 MB 且尾部有填充 → 移除填充");
