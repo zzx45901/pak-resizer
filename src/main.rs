@@ -6,7 +6,7 @@ const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 目标大小（至少）
 const PADDING_PATTERN: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
 fn main() -> io::Result<()> {
-    println!("===DN PAK 文件大小调整工具V1.2 ===\n");
+    println!("===DN PAK 文件智能大小调整工具v1.2 ===\n");
     println!("自动规则：");
     println!("  • 文件 < 500 MB → 填充至少至 500 MB");
     println!("  • 文件 ≥ 500 MB 且尾部有填充 → 移除填充");
@@ -29,14 +29,12 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        // 解析输入，得到所有目标路径（文件或文件夹）
         let raw_paths = parse_paths(input);
         if raw_paths.is_empty() {
             println!("未识别到有效路径，请重试。\n");
             continue;
         }
 
-        // 收集所有需要处理的 .pak 文件
         let mut pak_files: Vec<PathBuf> = Vec::new();
         for raw in raw_paths {
             let p = Path::new(&raw);
@@ -46,7 +44,6 @@ fn main() -> io::Result<()> {
             }
 
             if p.is_dir() {
-                // 扫描文件夹下的 .pak 文件（非递归）
                 match fs::read_dir(p) {
                     Ok(entries) => {
                         for entry in entries.flatten() {
@@ -72,7 +69,6 @@ fn main() -> io::Result<()> {
 
         println!("\n共找到 {} 个 .pak 文件，开始处理...", pak_files.len());
 
-        // 依次处理每个文件
         for (idx, file_path) in pak_files.iter().enumerate() {
             println!("\n[{}/{}] 处理: {}", idx + 1, pak_files.len(), file_path.display());
             match process_single_file(file_path) {
@@ -86,7 +82,6 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-/// 处理单个 PAK 文件（智能判断放大/缩小）
 fn process_single_file(file_path: &Path) -> io::Result<()> {
     let metadata = fs::metadata(file_path)?;
     let current_size = metadata.len();
@@ -94,15 +89,13 @@ fn process_single_file(file_path: &Path) -> io::Result<()> {
     println!("  当前大小: {} 字节 (≈{:.2} MB)", current_size, current_mb);
 
     if current_size < TARGET_SIZE {
-        // 放大：使用模式填充到 500 MB
         println!("  文件小于 500 MB，正在填充...");
         fill_with_pattern(file_path, TARGET_SIZE)?;
         println!("   已填充至至少 500 MB");
     } else {
-        // 检测尾部模式填充
         let (original_size, padding_len) = detect_pattern_padding(file_path)?;
-        if padding_len < 1024 {
-            println!("  未检测到明显模式填充，无需处理。");
+        if padding_len == 0 {
+            println!("  未检测到模式填充，无需处理。");
         } else {
             let removed_mb = padding_len as f64 / (1024.0 * 1024.0);
             let original_mb = original_size as f64 / (1024.0 * 1024.0);
@@ -116,7 +109,7 @@ fn process_single_file(file_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// 填充文件至至少 target_size，使用 0xDEADBEEF 重复模式
+/// 填充文件至至少 target_size，直接循环写入模式，不要求精确倍数
 fn fill_with_pattern(file_path: &Path, target_size: u64) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(file_path)?;
     let current_size = file.metadata()?.len();
@@ -126,26 +119,28 @@ fn fill_with_pattern(file_path: &Path, target_size: u64) -> io::Result<()> {
 
     file.seek(SeekFrom::Start(current_size))?;
     let mut writer = BufWriter::new(file);
-    let remaining = target_size - current_size;
-    // 计算需要写入的完整模式数量（向上取整）
-    let pattern_count = (remaining + 3) / 4;
-    let total_write = pattern_count * 4;
+    let mut remaining = target_size - current_size;
 
+    // 缓冲区大小设为 4 的倍数，但写入时可能多写几个字节也没关系
     let mut buffer = [0u8; 4096];
-    let mut written = 0u64;
-    while written < total_write {
-        let chunk = std::cmp::min(buffer.len() as u64, total_write - written) as usize;
+    // 填充缓冲区，循环写入
+    while remaining > 0 {
+        let chunk = std::cmp::min(remaining, buffer.len() as u64) as usize;
+        // 用模式填充整个 chunk
         for i in (0..chunk).step_by(4) {
-            buffer[i..i + 4].copy_from_slice(&PADDING_PATTERN);
+            let end = std::cmp::min(i + 4, chunk);
+            let copy_len = end - i;
+            buffer[i..end].copy_from_slice(&PADDING_PATTERN[..copy_len]);
         }
         writer.write_all(&buffer[..chunk])?;
-        written += chunk as u64;
+        remaining -= chunk as u64;
     }
     writer.flush()?;
     Ok(())
 }
 
 /// 检测文件末尾的 0xDEADBEEF 重复模式，返回（原始大小，填充长度）
+/// 简化逻辑：直接从末尾逐4字节匹配，不检查倍数和阈值
 fn detect_pattern_padding(path: &Path) -> io::Result<(u64, u64)> {
     let mut file = OpenOptions::new().read(true).open(path)?;
     let file_size = file.metadata()?.len();
@@ -155,57 +150,43 @@ fn detect_pattern_padding(path: &Path) -> io::Result<(u64, u64)> {
 
     let mut pos = file_size;
     let mut padding_bytes = 0u64;
-    let mut buf = vec![0u8; 4096];
+    let mut buf = [0u8; 4];
 
     while pos >= 4 {
-        let read_size = std::cmp::min(buf.len() as u64, pos) as usize;
-        let read_size = (read_size / 4) * 4; // 保证是4的倍数
-        if read_size == 0 {
+        // 读取当前位置的前4字节（从 pos-4 到 pos）
+        file.seek(SeekFrom::Start(pos - 4))?;
+        file.read_exact(&mut buf)?;
+
+        if &buf == &PADDING_PATTERN {
+            padding_bytes += 4;
+            pos -= 4;
+        } else {
+            // 不匹配，停止
             break;
         }
-
-        let seek_pos = pos - read_size as u64;
-        file.seek(SeekFrom::Start(seek_pos))?;
-        file.read_exact(&mut buf[..read_size])?;
-
-        let mut i = read_size;
-        while i >= 4 {
-            if &buf[i - 4..i] == &PADDING_PATTERN {
-                padding_bytes += 4;
-                i -= 4;
-            } else {
-                let original_size = seek_pos + i as u64;
-                return Ok((original_size, padding_bytes));
-            }
-        }
-        pos = seek_pos;
     }
 
-    Ok((0, file_size))
+    // original_size 就是 pos（第一个不匹配的位置）
+    Ok((pos, padding_bytes))
 }
 
-/// 解析输入字符串：优先按双引号拆分，再按盘符/UNC前缀拆分，不使用空格
+// ========== 路径解析（支持中文、双引号和盘符/UNC前缀） ==========
 fn parse_paths(input: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
     let bytes = input.as_bytes();
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-
-        if c == '"' {
-            // 遇到英文双引号：切换状态
+    let mut char_indices = input.char_indices().peekable();
+    while let Some((byte_idx, ch)) = char_indices.next() {
+        if ch == '"' {
             if in_quotes {
-                // 引号结束：保存当前引号内的路径
                 if !current.is_empty() {
                     paths.push(current.clone());
                     current.clear();
                 }
                 in_quotes = false;
             } else {
-                // 引号开始：如果当前有未保存的内容，先按盘符拆分保存
                 if !current.is_empty() {
                     let split = split_by_drive_prefix(&current);
                     paths.extend(split);
@@ -213,26 +194,38 @@ fn parse_paths(input: &str) -> Vec<String> {
                 }
                 in_quotes = true;
             }
-            i += 1;
             continue;
         }
 
-        // 如果不在引号内，检测盘符或UNC前缀作为新路径开始
-        if !in_quotes && (is_drive_prefix(bytes, i) || is_unc_prefix(bytes, i)) {
-            if !current.is_empty() {
-                paths.push(current.clone());
-                current.clear();
+        if !in_quotes {
+            // 盘符检测
+            if byte_idx + 2 < bytes.len()
+                && bytes[byte_idx].is_ascii_alphabetic()
+                && bytes[byte_idx + 1] == b':'
+                && bytes[byte_idx + 2] == b'\\'
+            {
+                if !current.is_empty() {
+                    paths.push(current.clone());
+                    current.clear();
+                }
+            }
+            // UNC 检测
+            else if byte_idx + 1 < bytes.len()
+                && bytes[byte_idx] == b'\\'
+                && bytes[byte_idx + 1] == b'\\'
+            {
+                if !current.is_empty() {
+                    paths.push(current.clone());
+                    current.clear();
+                }
             }
         }
 
-        current.push(c);
-        i += 1;
+        current.push(ch);
     }
 
-    // 处理最后剩余的缓冲区
     if !current.is_empty() {
         if in_quotes {
-            // 引号未闭合，但按内容处理
             paths.push(current);
         } else {
             let split = split_by_drive_prefix(&current);
@@ -240,46 +233,37 @@ fn parse_paths(input: &str) -> Vec<String> {
         }
     }
 
-    // 清理：去除首尾空格（理论上不应有）
     paths.into_iter()
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect()
 }
 
-/// 对不含引号的字符串按盘符/UNC前缀拆分
 fn split_by_drive_prefix(s: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
     let bytes = s.as_bytes();
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if (is_drive_prefix(bytes, i) || is_unc_prefix(bytes, i)) && !current.is_empty() {
-            result.push(current.clone());
-            current.clear();
+    let mut char_indices = s.char_indices().peekable();
+    while let Some((byte_idx, ch)) = char_indices.next() {
+        if (byte_idx + 2 < bytes.len()
+            && bytes[byte_idx].is_ascii_alphabetic()
+            && bytes[byte_idx + 1] == b':'
+            && bytes[byte_idx + 2] == b'\\')
+            || (byte_idx + 1 < bytes.len()
+                && bytes[byte_idx] == b'\\'
+                && bytes[byte_idx + 1] == b'\\')
+        {
+            if !current.is_empty() {
+                result.push(current.clone());
+                current.clear();
+            }
         }
-        current.push(c);
-        i += 1;
+        current.push(ch);
     }
+
     if !current.is_empty() {
         result.push(current);
     }
     result
-}
-
-fn is_drive_prefix(bytes: &[u8], i: usize) -> bool {
-    if i + 2 < bytes.len() {
-        let c1 = bytes[i].to_ascii_uppercase();
-        let c2 = bytes[i + 1];
-        let c3 = bytes[i + 2];
-        c1.is_ascii_alphabetic() && c2 == b':' && c3 == b'\\'
-    } else {
-        false
-    }
-}
-
-fn is_unc_prefix(bytes: &[u8], i: usize) -> bool {
-    i + 1 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'\\'
 }
