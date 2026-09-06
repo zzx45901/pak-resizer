@@ -6,7 +6,7 @@ const TARGET_SIZE: u64 = 500 * 1024 * 1024; // 目标大小（至少）
 const PADDING_PATTERN: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
 fn main() -> io::Result<()> {
-    println!("=== DN PAK 文件大小调整工具V1.2 ===\n");
+    println!("===DN PAK 文件大小调整工具V1.2 ===\n");
     println!("自动规则：");
     println!("  • 文件 < 500 MB → 填充至少至 500 MB");
     println!("  • 文件 ≥ 500 MB 且尾部有填充 → 移除填充");
@@ -102,11 +102,11 @@ fn process_single_file(file_path: &Path) -> io::Result<()> {
         // 检测尾部模式填充
         let (original_size, padding_len) = detect_pattern_padding(file_path)?;
         if padding_len < 1024 {
-            println!("  未检测到明显填充，无需处理。");
+            println!("  未检测到明显模式填充，无需处理。");
         } else {
             let removed_mb = padding_len as f64 / (1024.0 * 1024.0);
             let original_mb = original_size as f64 / (1024.0 * 1024.0);
-            println!("  检测到填充 {} 字节 (≈{:.2} MB)", padding_len, removed_mb);
+            println!("  检测到模式填充 {} 字节 (≈{:.2} MB)", padding_len, removed_mb);
             println!("  移除填充后大小: {} 字节 (≈{:.2} MB)", original_size, original_mb);
             let file = OpenOptions::new().write(true).open(file_path)?;
             file.set_len(original_size)?;
@@ -184,7 +184,7 @@ fn detect_pattern_padding(path: &Path) -> io::Result<(u64, u64)> {
     Ok((0, file_size))
 }
 
-/// 解析输入字符串：通过盘符（X:\）或 UNC 前缀（\\）识别路径边界，同时支持双引号
+/// 解析输入字符串：优先按双引号拆分，再按盘符/UNC前缀拆分，不使用空格
 fn parse_paths(input: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut current = String::new();
@@ -196,12 +196,28 @@ fn parse_paths(input: &str) -> Vec<String> {
         let c = bytes[i] as char;
 
         if c == '"' {
-            in_quotes = !in_quotes;
+            // 遇到英文双引号：切换状态
+            if in_quotes {
+                // 引号结束：保存当前引号内的路径
+                if !current.is_empty() {
+                    paths.push(current.clone());
+                    current.clear();
+                }
+                in_quotes = false;
+            } else {
+                // 引号开始：如果当前有未保存的内容，先按盘符拆分保存
+                if !current.is_empty() {
+                    let split = split_by_drive_prefix(&current);
+                    paths.extend(split);
+                    current.clear();
+                }
+                in_quotes = true;
+            }
             i += 1;
             continue;
         }
 
-        // 如果不在引号内且检测到盘符或 UNC 前缀，说明新路径开始
+        // 如果不在引号内，检测盘符或UNC前缀作为新路径开始
         if !in_quotes && (is_drive_prefix(bytes, i) || is_unc_prefix(bytes, i)) {
             if !current.is_empty() {
                 paths.push(current.clone());
@@ -213,18 +229,46 @@ fn parse_paths(input: &str) -> Vec<String> {
         i += 1;
     }
 
+    // 处理最后剩余的缓冲区
     if !current.is_empty() {
-        paths.push(current);
+        if in_quotes {
+            // 引号未闭合，但按内容处理
+            paths.push(current);
+        } else {
+            let split = split_by_drive_prefix(&current);
+            paths.extend(split);
+        }
     }
 
-    // 清理：去除首尾空格和可能残留的引号
+    // 清理：去除首尾空格（理论上不应有）
     paths.into_iter()
-        .map(|p| p.trim().trim_matches('"').to_string())
+        .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect()
 }
 
-/// 检查从位置 i 开始是否为盘符模式（字母 + ':' + '\'）
+/// 对不含引号的字符串按盘符/UNC前缀拆分
+fn split_by_drive_prefix(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if (is_drive_prefix(bytes, i) || is_unc_prefix(bytes, i)) && !current.is_empty() {
+            result.push(current.clone());
+            current.clear();
+        }
+        current.push(c);
+        i += 1;
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
 fn is_drive_prefix(bytes: &[u8], i: usize) -> bool {
     if i + 2 < bytes.len() {
         let c1 = bytes[i].to_ascii_uppercase();
@@ -236,7 +280,6 @@ fn is_drive_prefix(bytes: &[u8], i: usize) -> bool {
     }
 }
 
-/// 检查从位置 i 开始是否为 UNC 路径前缀（'\\'）
 fn is_unc_prefix(bytes: &[u8], i: usize) -> bool {
     i + 1 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'\\'
 }
